@@ -7,13 +7,12 @@ use std::{
 use axum::{
     body,
     extract::{Extension, Path, Query},
-    http::{self, header, Method, Request, StatusCode},
+    http::{self, header, Method, StatusCode},
     response::{AppendHeaders, IntoResponse},
     routing::get,
     Router,
 };
 use fast_image_resize as fir;
-use hyper::Body;
 use image::{codecs::jpeg::JpegEncoder, ImageEncoder};
 use reqwest::Client;
 use serde::Deserialize;
@@ -47,8 +46,12 @@ async fn main() {
         )
         .layer(TraceLayer::new_for_http());
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    tracing::debug!("listening on {}", addr);
+    let addr = SocketAddr::from((
+        [127, 0, 0, 1],
+        std::env::var("PORT").map(|p| p.parse().unwrap()).unwrap_or(3000u16),
+    ));
+
+    tracing::info!("Listening on {}", addr);
     axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
 }
 
@@ -115,7 +118,7 @@ async fn handler(
         src_image.pixel_type(),
     );
 
-    let mut resizer = fir::Resizer::new(fir::ResizeAlg::Convolution(fir::FilterType::Bilinear));
+    let mut resizer = fir::Resizer::new(fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3));
     if let Err(err) = resizer.resize(&src_image.view(), &mut dst_image.view_mut()) {
         tracing::error!(path, "Resize image error {err:#}");
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "Resize image error"));
