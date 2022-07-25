@@ -56,7 +56,6 @@ async fn handler(
     Extension(client): Extension<Client>,
     Query(params): Query<Params>,
     Path(path): Path<String>,
-    req: Request<Body>,
 ) -> impl IntoResponse {
     let start = Instant::now();
 
@@ -65,28 +64,29 @@ async fn handler(
         .send()
         .await
         .map_err(|err| {
-            tracing::info!("Request error {err:#}");
+            tracing::info!(path, "Request error {err:#}");
             (StatusCode::NOT_FOUND, "Not Found")
         })?;
 
     if !resp.status().is_success() {
-        tracing::info!("Request error: status code {}", resp.status());
+        tracing::info!(path, "Request error: status code {}", resp.status());
         return Err((StatusCode::NOT_FOUND, "Not Found"));
     }
 
     let bytes = resp.bytes().await.map_err(|err| {
-        tracing::error!("Request get bytes error {err:#}");
-
+        tracing::error!(path, "Request get bytes error {err:#}");
         (StatusCode::INTERNAL_SERVER_ERROR, "Decode response error")
     })?;
 
-    tracing::info!(elapsed = start.elapsed().as_millis(), "Fetched image");
+    let time_fetch = start.elapsed();
+    let start = Instant::now();
     let image = image::load_from_memory(&bytes[..]).map_err(|err| {
-        tracing::error!("Decode image error {err:#}");
+        tracing::error!(path, "Decode image error {err:#}");
         (StatusCode::INTERNAL_SERVER_ERROR, "Decode image error")
     })?;
 
-    tracing::info!(elapsed = start.elapsed().as_millis(), "Decoded image");
+    let time_decode = start.elapsed();
+    let start = Instant::now();
     let src_image = fir::Image::from_vec_u8(
         NonZeroU32::new(image.width()).unwrap(),
         NonZeroU32::new(image.height()).unwrap(),
@@ -95,19 +95,35 @@ async fn handler(
     )
     .unwrap();
 
+    let (dst_width, dst_height) = {
+        if let (Some(width), Some(height)) = (params.width, params.height) {
+            (width.get(), height.get())
+        } else if let Some(width) = params.width {
+            let ratio = width.get() as f32 / src_image.width().get() as f32;
+            (width.get(), (src_image.height().get() as f32 * ratio) as u32)
+        } else if let Some(height) = params.height {
+            let ratio = height.get() as f32 / src_image.height().get() as f32;
+            ((src_image.width().get() as f32 * ratio) as u32, height.get())
+        } else {
+            (src_image.width().get() / 4, src_image.height().get() / 4)
+        }
+    };
+
     let mut dst_image = fir::Image::new(
-        NonZeroU32::new(image.width() / 4).unwrap(),
-        NonZeroU32::new(image.height() / 4).unwrap(),
+        NonZeroU32::new(dst_width).unwrap(),
+        NonZeroU32::new(dst_height).unwrap(),
         src_image.pixel_type(),
     );
 
     let mut resizer = fir::Resizer::new(fir::ResizeAlg::Convolution(fir::FilterType::Bilinear));
     if let Err(err) = resizer.resize(&src_image.view(), &mut dst_image.view_mut()) {
-        tracing::error!({ uri = req.uri().path() }, "Resize image error {err:#}");
+        tracing::error!(path, "Resize image error {err:#}");
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "Resize image error"));
     }
 
-    tracing::info!(elapsed = start.elapsed().as_millis(), "Resized image");
+    let time_resize = start.elapsed();
+    let start = Instant::now();
+
     let mut result_buf = Vec::new();
     JpegEncoder::new(&mut result_buf)
         .write_image(
@@ -118,7 +134,20 @@ async fn handler(
         )
         .unwrap();
 
-    tracing::info!(elapsed = start.elapsed().as_millis(), "Encoded image");
+    let time_encode = start.elapsed();
+    tracing::info!(
+        "Image processed path={} original={}x{} resized={}x{} fetch={}ms decode={}ms resize={}ms encode={}ms",
+        path,
+        src_image.width(),
+        src_image.height(),
+        dst_image.width(),
+        dst_image.height(),
+        time_fetch.as_millis(),
+        time_decode.as_millis(),
+        time_resize.as_millis(),
+        time_encode.as_millis(),
+    );
+
     Ok((
         AppendHeaders([
             (header::CONTENT_TYPE, "image/jpeg"),
