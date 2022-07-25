@@ -47,7 +47,7 @@ async fn main() {
         .layer(TraceLayer::new_for_http());
 
     let addr = SocketAddr::from((
-        [127, 0, 0, 1],
+        [0, 0, 0, 0],
         std::env::var("PORT").map(|p| p.parse().unwrap()).unwrap_or(3000u16),
     ));
 
