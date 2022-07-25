@@ -68,24 +68,45 @@ async fn handler(
         .await
         .map_err(|err| {
             tracing::info!(path, "Request error {err:#}");
-            (StatusCode::NOT_FOUND, "Not Found")
+            (
+                StatusCode::NOT_FOUND,
+                AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
+                "Not Found",
+            )
+                .into_response()
         })?;
 
     if !resp.status().is_success() {
         tracing::info!(path, "Request error: status code {}", resp.status());
-        return Err((StatusCode::NOT_FOUND, "Not Found"));
+        return Err((
+            StatusCode::NOT_FOUND,
+            AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
+            "Not Found",
+        )
+            .into_response());
     }
 
     let bytes = resp.bytes().await.map_err(|err| {
         tracing::error!(path, "Request get bytes error {err:#}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Decode response error")
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=86400")]),
+            "Decode response error",
+        )
+            .into_response()
     })?;
 
     let time_fetch = start.elapsed();
     let start = Instant::now();
     let image = image::load_from_memory(&bytes[..]).map_err(|err| {
+        // Cache this response since this file most likely is not an image
         tracing::error!(path, "Decode image error {err:#}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Decode image error")
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=604800")]),
+            "Decode image error",
+        )
+            .into_response()
     })?;
 
     let time_decode = start.elapsed();
@@ -121,7 +142,12 @@ async fn handler(
     let mut resizer = fir::Resizer::new(fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3));
     if let Err(err) = resizer.resize(&src_image.view(), &mut dst_image.view_mut()) {
         tracing::error!(path, "Resize image error {err:#}");
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Resize image error"));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
+            "Resize image error",
+        )
+            .into_response());
     }
 
     let time_resize = start.elapsed();
