@@ -1,6 +1,7 @@
 use std::{
     net::SocketAddr,
     num::NonZeroU32,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -12,6 +13,7 @@ use axum::{
     routing::get,
     Router,
 };
+use clap::Parser;
 use fast_image_resize as fir;
 use image::{codecs::jpeg::JpegEncoder, ImageEncoder};
 use reqwest::Client;
@@ -21,9 +23,26 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+#[derive(Parser, Clone)]
+#[clap(version)]
+struct Cli {
+    #[clap(short, long, value_parser)]
+    port: Option<u16>,
+    #[clap(short, long, value_parser)]
+    remote_cdn: Option<String>,
+    #[clap(short, long, value_parser)]
+    local_folder: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
+
+    if cli.remote_cdn.is_none() && cli.local_folder.is_none() {
+        tracing::error!("Either 'remote_cdn' or 'local_folder' is required");
+        return;
+    }
 
     let client = Client::builder()
         .gzip(true)
@@ -35,6 +54,7 @@ async fn main() {
     let app = Router::new()
         .route("/*path", get(handler))
         .layer(Extension(client))
+        .layer(Extension(cli.clone()))
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(
@@ -46,10 +66,7 @@ async fn main() {
         )
         .layer(TraceLayer::new_for_http());
 
-    let addr = SocketAddr::from((
-        [0, 0, 0, 0],
-        std::env::var("PORT").map(|p| p.parse().unwrap()).unwrap_or(3000u16),
-    ));
+    let addr = SocketAddr::from(([0, 0, 0, 0], cli.port.unwrap_or(3000)));
 
     tracing::info!("Listening on {}", addr);
     axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
@@ -57,47 +74,81 @@ async fn main() {
 
 async fn handler(
     Extension(client): Extension<Client>,
+    Extension(config): Extension<Cli>,
     Query(params): Query<Params>,
     Path(path): Path<String>,
 ) -> impl IntoResponse {
     let start = Instant::now();
 
-    let resp = client
-        .get(format!("https://cdn.remtori.com/{}", path))
-        .send()
-        .await
-        .map_err(|err| {
-            tracing::info!(path, "Request error {err:#}");
-            (
-                StatusCode::NOT_FOUND,
-                AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
-                "Not Found",
-            )
-                .into_response()
-        })?;
+    let mut bytes = None;
+    if let Some(file_path) = config.local_folder {
+        let mut file_path = PathBuf::from(file_path);
+        file_path.push(&path);
 
-    if !resp.status().is_success() {
-        tracing::info!(path, "Request error: status code {}", resp.status());
-        return Err((
-            StatusCode::NOT_FOUND,
-            AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
-            "Not Found",
-        )
-            .into_response());
+        match tokio::fs::read(file_path).await {
+            Ok(data) => bytes = Some(bytes::Bytes::from(data)),
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!(path, "Read local file error {err:#}");
+                }
+
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
+                    "Not Found",
+                )
+                    .into_response());
+            }
+        }
     }
 
-    let bytes = resp.bytes().await.map_err(|err| {
-        tracing::error!(path, "Request get bytes error {err:#}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=86400")]),
-            "Decode response error",
-        )
-            .into_response()
-    })?;
+    if bytes.is_none() {
+        if let Some(mut url) = config.remote_cdn {
+            if url.chars().last().unwrap() == '/' {
+                url.push_str(&path[1..]);
+            } else {
+                url.push_str(&path);
+            }
+
+            let resp = client.get(url).send().await.map_err(|err| {
+                tracing::info!(path, "Request error {err:#}");
+                (
+                    StatusCode::NOT_FOUND,
+                    AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
+                    "Not Found",
+                )
+                    .into_response()
+            })?;
+
+            if !resp.status().is_success() {
+                tracing::info!(path, "Request error: status code {}", resp.status());
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
+                    "Not Found",
+                )
+                    .into_response());
+            }
+
+            match resp.bytes().await {
+                Ok(data) => bytes = Some(data),
+                Err(err) => {
+                    tracing::error!(path, "Request get bytes error {err:#}");
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=86400")]),
+                        "Decode response error",
+                    )
+                        .into_response());
+                }
+            }
+        }
+    }
 
     let time_fetch = start.elapsed();
     let start = Instant::now();
+    let bytes = bytes.ok_or_else(|| (StatusCode::NOT_IMPLEMENTED).into_response())?;
+
     let image = image::load_from_memory(&bytes[..]).map_err(|err| {
         // Cache this response since this file most likely is not an image
         tracing::error!(path, "Decode image error {err:#}");
