@@ -68,6 +68,14 @@ async fn main() {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port.unwrap_or(3000)));
 
+    tracing::info!("Running image resize server with:");
+    if let Some(folder) = cli.local_folder {
+        tracing::info!("\tlocal folder: {folder}");
+    }
+    if let Some(url) = cli.remote_cdn {
+        tracing::info!("\tremote cdn: {url}");
+    }
+
     tracing::info!("Listening on {}", addr);
     axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
 }
