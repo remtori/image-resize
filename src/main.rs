@@ -99,13 +99,6 @@ async fn handler(
                 if err.kind() != std::io::ErrorKind::NotFound {
                     tracing::error!(path, "Read local file error {err:#}");
                 }
-
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
-                    "Not Found",
-                )
-                    .into_response());
             }
         }
     }
@@ -118,36 +111,18 @@ async fn handler(
                 url.push_str(&path);
             }
 
-            let resp = client.get(url).send().await.map_err(|err| {
-                tracing::info!(path, "Request error {err:#}");
-                (
-                    StatusCode::NOT_FOUND,
-                    AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
-                    "Not Found",
-                )
-                    .into_response()
-            })?;
-
-            if !resp.status().is_success() {
-                tracing::info!(path, "Request error: status code {}", resp.status());
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
-                    "Not Found",
-                )
-                    .into_response());
-            }
-
-            match resp.bytes().await {
-                Ok(data) => bytes = Some(data),
+            match client.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                    Ok(data) => bytes = Some(data),
+                    Err(err) => {
+                        tracing::error!(path, "Request get bytes error {err:#}");
+                    }
+                },
+                Ok(resp) => {
+                    tracing::info!(path, "Request error: status code {}", resp.status());
+                }
                 Err(err) => {
-                    tracing::error!(path, "Request get bytes error {err:#}");
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=86400")]),
-                        "Decode response error",
-                    )
-                        .into_response());
+                    tracing::info!(path, "Request error {err:#}");
                 }
             }
         }
@@ -155,7 +130,13 @@ async fn handler(
 
     let time_fetch = start.elapsed();
     let start = Instant::now();
-    let bytes = bytes.ok_or_else(|| (StatusCode::NOT_IMPLEMENTED).into_response())?;
+    let bytes = bytes.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            AppendHeaders([(header::CACHE_CONTROL, "public, s-max-age=28800")]),
+        )
+            .into_response()
+    })?;
 
     let image = image::load_from_memory(&bytes[..]).map_err(|err| {
         // Cache this response since this file most likely is not an image
