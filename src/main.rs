@@ -7,11 +7,12 @@ use std::{
 
 use axum::{
     body,
+    error_handling::HandleErrorLayer,
     extract::{Extension, Path, Query},
     http::{self, header, Method, StatusCode},
     response::{AppendHeaders, IntoResponse},
     routing::get,
-    Router,
+    BoxError, Router,
 };
 use clap::Parser;
 use fast_image_resize as fir;
@@ -64,6 +65,11 @@ async fn main() {
                 ))
                 .allow_methods([Method::GET]),
         )
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_error))
+                .timeout(Duration::from_secs(30)),
+        )
         .layer(TraceLayer::new_for_http());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port.unwrap_or(3000)));
@@ -78,6 +84,11 @@ async fn main() {
 
     tracing::info!("Listening on {}", addr);
     axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
+}
+
+async fn handle_error(err: BoxError) -> StatusCode {
+    tracing::warn!("Unhandled error: {err:#}");
+    StatusCode::NOT_FOUND
 }
 
 async fn handler(
@@ -160,12 +171,15 @@ async fn handler(
     .unwrap();
 
     let (dst_width, dst_height) = {
-        if let (Some(width), Some(height)) = (params.width, params.height) {
+        let width = params.width.or(params.w);
+        let height = params.height.or(params.h);
+
+        if let (Some(width), Some(height)) = (width, height) {
             (width.get(), height.get())
-        } else if let Some(width) = params.width {
+        } else if let Some(width) = width {
             let ratio = width.get() as f32 / src_image.width().get() as f32;
             (width.get(), (src_image.height().get() as f32 * ratio) as u32)
-        } else if let Some(height) = params.height {
+        } else if let Some(height) = height {
             let ratio = height.get() as f32 / src_image.height().get() as f32;
             ((src_image.width().get() as f32 * ratio) as u32, height.get())
         } else {
@@ -230,4 +244,6 @@ async fn handler(
 struct Params {
     width: Option<NonZeroU32>,
     height: Option<NonZeroU32>,
+    w: Option<NonZeroU32>,
+    h: Option<NonZeroU32>,
 }
